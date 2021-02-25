@@ -4,6 +4,7 @@ using System.IO;
 using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
+using dotnetCampus.FileDownloader.Utils;
 using dotnetCampus.Threading;
 using Microsoft.Extensions.Logging;
 
@@ -60,19 +61,18 @@ namespace dotnetCampus.FileDownloader
         /// 下载链接
         /// </summary>
         public string Url { get; }
+
         private AsyncQueue<DownloadData> DownloadDataList { get; } = new AsyncQueue<DownloadData>();
+
         /// <summary>
         /// 下载的文件
         /// </summary>
         public FileInfo File { get; }
-        /// <summary>
-        /// 定时检测的最后时间
-        /// </summary>
-        private DateTime LastTime { get; set; } = DateTime.Now;
-        /// <summary>
-        /// 默认启用3个线程
-        /// </summary>
-        private SemaphoreSlim semaphoreSlim = new SemaphoreSlim(3);
+        ///// <summary>
+        ///// 定时检测的最后时间
+        ///// </summary>
+        //private DateTime LastTime { get; set; } = DateTime.Now;
+
         private readonly ILogger<SegmentFileDownloader> _logger;
         private readonly IProgress<DownloadProgress> _progress;
 
@@ -85,41 +85,80 @@ namespace dotnetCampus.FileDownloader
         private TaskCompletionSource<bool> FileDownloadTask { get; } = new TaskCompletionSource<bool>();
         private SegmentManager SegmentManager { set; get; } = null!;
         private int _idGenerator;
-        private int _maxThread = 10;
 
         /// <summary>
         /// 每一次分段下载的超时时间，默认10秒
         /// </summary>
         public TimeSpan StepTimeOut { get; }
-        private void DownReleaseOnce()
-        {
-            if (DownloadDataList.Count > 0)
-            {
-                if (semaphoreSlim.CurrentCount == 0) semaphoreSlim.Release();
-            }
-        }
+
+        //变速器3秒为一周期
+        private TimeSpan ControlDelayTime { get; } = TimeSpan.FromSeconds(3);
+
+        /// <summary>
+        /// 最大线程数量
+        /// </summary>
+        private int MaxThreadCount { get; } = 10;
+
         /// <summary>
         /// 网速控制开关
         /// </summary>
-        /// <param name="downloadSegment"></param>
         /// <returns></returns>
-        private void ControlSwitch(DownloadSegment downloadSegment)
+        private async void ControlSwitch()
         {
-            //小于3秒维护现状
-            if ((DateTime.Now - LastTime).TotalSeconds > 3)
+            // 使用独立的线程的优势在于不需要等待下载就能进入方法
+            // 可以干掉 LastTime 属性，因此定时是 3 秒
+            await Task.Delay(ControlDelayTime);
+
+            while (!SegmentManager.IsFinished())
             {
-                //变速器3秒为一周期
-                LastTime = DateTime.Now;
-                lock (downloadSegment)
+                LogDebugInternal("Start ControlSwitch");
+                var (segment, runCount, maxReportTime) = SegmentManager.GetDownloadSegmentStatus();
+                int waitCount = DownloadDataList.Count;
+
+                LogDebugInternal("ControlSwitch 当前等待数量：{0},待命最大响应时间：{1},运行数量：{2},运行线程{3}", waitCount, maxReportTime, runCount, _threadCount);
+
+                if (maxReportTime > TimeSpan.FromSeconds(10) && segment != null && runCount > 1)
                 {
-                    SegmentManager.GetDownloadSegmentStatus(out DownloadSegment? segment, out int runCount, out double maxReportTime);
-                    int waitCount = DownloadDataList.Count;
-                    Debug.WriteLine($"当前等待数量：{waitCount},待命最大响应时间：{maxReportTime},运行数量：{runCount}");
-                    if (maxReportTime > 10 * 1000 && segment != null && runCount > 1) segment.LoadingState = DownloadingState.Pause;
-                    else if (maxReportTime < 600 && waitCount > 0 || runCount < 1) DownReleaseOnce();
+                    // 此时速度太慢
+                    segment.LoadingState = DownloadingState.Pause;
+                    LogDebugInternal("ControlSwitch slowly pause segment={0}", segment.Number);
                 }
+                else if (maxReportTime < TimeSpan.FromMilliseconds(600) && waitCount > 0 || runCount < 1)
+                {
+                    // 速度非常快，尝试再开线程，或者当前没有在进行的任务
+                    // 如果此时是刚好全部完成了，而 runCount 是 0 进入 StartDownloadTask 也将会啥都不做
+                    LogDebugInternal("ControlSwitch StartDownloadTask");
+
+                    // 这里不需要线程安全，如果刚好全部线程都在退出，等待 ControlDelayTime 再次创建
+                    if (_threadCount < MaxThreadCount)
+                    {
+                        StartDownloadTask();
+                    }
+                }
+
+                LogDebugInternal("Finish ControlSwitch");
+                //变速器3秒为一周期
+                await Task.Delay(ControlDelayTime);
             }
         }
+
+        /// <summary>
+        /// 开启线程下载
+        /// </summary>
+        private void StartDownloadTask()
+        {
+            _ = Task.Run(DownloadTaskInner);
+
+            async Task DownloadTaskInner()
+            {
+                Interlocked.Increment(ref _threadCount);
+                await DownloadTask();
+                Interlocked.Decrement(ref _threadCount);
+            }
+        }
+
+        private int _threadCount;
+
         /// <summary>
         /// 开始下载文件
         /// </summary>
@@ -157,28 +196,40 @@ namespace dotnetCampus.FileDownloader
 
             var supportSegment = await TryDownloadLast(contentLength);
 
-            //var threadCount = 1;
+            int threadCount;
+
+            if (supportSegment)
+            {
+                // 先根据文件的大小，大概是 1M 让一个线程下载，至少需要开两个线程，最多是 10 个线程
+                threadCount = Math.Min(MaxThreadCount, Math.Max(2, (int) (contentLength / 1024 / 1024)));
+            }
+            else
+            {
+                // 不支持分段下载下，多个线程也没啥用
+                threadCount = 1;
+            }
 
             if (supportSegment)
             {
                 // 多创建几个线程下载
-                //threadCount = 10;
-
-                for (var i = 0; i < _maxThread; i++)
+                for (var i = 0; i < threadCount; i++)
                 {
                     Download(SegmentManager.GetNewDownloadSegment());
                 }
+
+                //控制开关，如果下载阻塞就先暂停
+                ControlSwitch();
             }
 
-            for (var i = 0; i < _maxThread; i++)
+            // 一开始就创建足够量的线程尝试下载
+            for (var i = 0; i < threadCount; i++)
             {
-                _ = Task.Run(DownloadTask);
+                StartDownloadTask();
             }
 
             await FileDownloadTask.Task;
         }
 
-       
         /// <summary>
         /// 获取整个下载的长度
         /// </summary>
@@ -202,7 +253,32 @@ namespace dotnetCampus.FileDownloader
             return (response, contentLength);
         }
 
-        private async Task<WebResponse?> GetWebResponseAsync(Action<HttpWebRequest>? action = null)
+        /// <summary>
+        /// 通过 Url 创建出对应的 <see cref="WebRequest"/> 实例
+        /// </summary>
+        /// <param name="url"></param>
+        /// <returns></returns>
+        protected virtual WebRequest CreateWebRequest(string url) => (WebRequest) WebRequest.Create(url);
+
+        /// <summary>
+        /// 在 <see cref="WebRequest"/> 经过了应用设置之后调用，应用的设置包括下载的 Range 等值，调用这个方法之后的下一步将会是使用这个方法的返回值去下载文件
+        /// </summary>
+        /// <param name="webRequest"></param>
+        /// <returns></returns>
+        protected virtual WebRequest OnWebRequestSet(WebRequest webRequest) => webRequest;
+
+        /// <summary>
+        /// 这是给我自己开发调试用的
+        /// </summary>
+        /// <param name="message"></param>
+        /// <param name="args"></param>
+        [Conditional("DEBUG")]
+        private void LogDebugInternal(string message, params object[] args)
+        {
+            _logger.LogDebug(message, args);
+        }
+
+        private async Task<WebResponse?> GetWebResponseAsync(Action<WebRequest>? action = null)
         {
             var id = Interlocked.Increment(ref _idGenerator);
 
@@ -213,25 +289,31 @@ namespace dotnetCampus.FileDownloader
                 try
                 {
                     var url = Url;
-                    _logger.LogDebug("[GetWebResponseAsync] [{0}] Create WebRequest. Retry Count {0}", id, i);
-                    var webRequest = (HttpWebRequest)WebRequest.Create(url);
+                    LogDebugInternal("[GetWebResponseAsync] [{0}] Create WebRequest. Retry Count {0}", id, i);
+                    var webRequest = CreateWebRequest(url);
                     webRequest.Method = "GET";
                     // 加上超时，支持弱网
                     // Timeout设置的是从发出请求开始算起，到与服务器建立连接的时间
                     // ReadWriteTimeout设置的是从建立连接开始，到下载数据完毕所历经的时间
                     // 即使下载速度再慢，只有要在下载，也不能算超时
                     // 如果下载 BufferLength 长度 默认 65535 字节时间超过 10 秒，基本上也断开也差不多
-                    webRequest.Timeout = (int)StepTimeOut.TotalMilliseconds;
-                    webRequest.ReadWriteTimeout = (int)StepTimeOut.TotalMilliseconds;
+                    webRequest.Timeout = (int) StepTimeOut.TotalMilliseconds;
 
-                    _logger.LogDebug("[GetWebResponseAsync] [{0}] Enter action.", id);
+                    if (webRequest is HttpWebRequest httpWebRequest)
+                    {
+                        // ReadWriteTimeout设置的是从建立连接开始，到下载数据完毕所历经的时间
+                        httpWebRequest.ReadWriteTimeout = (int) StepTimeOut.TotalMilliseconds;
+                    }
+
+                    LogDebugInternal("[GetWebResponseAsync] [{0}] Enter action.", id);
                     action?.Invoke(webRequest);
+                    webRequest = OnWebRequestSet(webRequest);
 
                     var stopwatch = Stopwatch.StartNew();
-                    _logger.LogDebug("[GetWebResponseAsync] [{0}] Start GetResponseAsync.", id);
-                    var response = await webRequest.GetResponseAsync();
+                    LogDebugInternal("[GetWebResponseAsync] [{0}] Start GetResponseAsync.", id);
+                    var response = await GetResponseAsync(webRequest);
                     stopwatch.Stop();
-                    _logger.LogDebug("[GetWebResponseAsync] [{0}] Finish GetResponseAsync. Cost time {1} ms", id,
+                    LogDebugInternal("[GetWebResponseAsync] [{0}] Finish GetResponseAsync. Cost time {1} ms", id,
                         stopwatch.ElapsedMilliseconds);
 
                     return response;
@@ -263,12 +345,20 @@ namespace dotnetCampus.FileDownloader
                 }
 
                 // 后续需要配置不断下降时间
-                _logger.LogDebug("[GetWebResponseAsync] [{0}] Delay {1} ms", id, retryDelayTime.TotalMilliseconds);
+                LogDebugInternal("[GetWebResponseAsync] [{0}] Delay {1} ms", id, retryDelayTime.TotalMilliseconds);
                 await Task.Delay(retryDelayTime);
             }
 
             return null;
         }
+
+        /// <summary>
+        /// 给继承的类可以从 <paramref name="request"/> 获取消息
+        /// </summary>
+        /// <param name="request"></param>
+        /// <returns></returns>
+        protected virtual Task<WebResponse> GetResponseAsync(WebRequest request)
+            => request.GetResponseAsync();
 
         /// <summary>
         /// 尝试获取链接响应
@@ -283,7 +373,9 @@ namespace dotnetCampus.FileDownloader
             // 为什么不使用 StartPoint 而是使用 CurrentDownloadPoint 是因为需要处理重试
 
             var response = await GetWebResponseAsync(webRequest =>
-                webRequest.AddRange(downloadSegment.CurrentDownloadPoint, downloadSegment.RequirementDownloadPoint));
+            {
+                webRequest.AddRange(downloadSegment.CurrentDownloadPoint, downloadSegment.RequirementDownloadPoint);
+            });
             return response;
         }
 
@@ -291,7 +383,8 @@ namespace dotnetCampus.FileDownloader
         {
             while (!SegmentManager.IsFinished())
             {
-                await semaphoreSlim.WaitAsync();
+                // 不需要进行等待，就是开始下载
+                //await semaphoreSlim.WaitAsync();
                 var data = await DownloadDataList.DequeueAsync();
 
                 // 没有内容了
@@ -332,12 +425,17 @@ namespace dotnetCampus.FileDownloader
                         // 如果当前下载的内容依然是长段的，也就是 RequirementDownloadPoint-StartPoint 长度比较大，那么下载完成后请求新的下载
                         Download(SegmentManager.GetNewDownloadSegment());
                     }
-                    DownReleaseOnce();
                 }
                 else
                 {
-                    // 如果当前这一段还没完成，那么放回去继续下载
+                    // 如果当前这一段还没完成，那么放回去继续下载，如果是当前下载速度太慢的，暂停一会
                     Download(downloadSegment);
+
+                    if (downloadSegment.LoadingState == DownloadingState.Pause)
+                    {
+                        // 暂停一会，也就是当前线程退出
+                        return;
+                    }
                 }
             }
 
@@ -360,7 +458,10 @@ namespace dotnetCampus.FileDownloader
             }
 
             downloadSegment.Message = "Start GetResponseStream";
-            await using var responseStream = response.GetResponseStream();
+#if NETCOREAPP
+            await
+#endif
+            using var responseStream = response.GetResponseStream();
             downloadSegment.Message = "Finish GetResponseStream";
 
             int length = BufferLength;
@@ -368,17 +469,17 @@ namespace dotnetCampus.FileDownloader
 
             while (!downloadSegment.Finished)
             {
-                _logger.LogDebug("[DownloadSegmentInner] Start Rent Array. {0}", downloadSegment);
+                LogDebugInternal("[DownloadSegmentInner] Start Rent Array. {0}", downloadSegment);
                 var buffer = SharedArrayPool.Rent(length);
-                _logger.LogDebug("[DownloadSegmentInner] Finish Rent Array. {0}", downloadSegment);
+                LogDebugInternal("[DownloadSegmentInner] Finish Rent Array. {0}", downloadSegment);
 
                 downloadSegment.Message = "Start ReadAsync";
-                _logger.LogDebug("[DownloadSegmentInner] Start ReadAsync. {0}", downloadSegment);
+                LogDebugInternal("[DownloadSegmentInner] Start ReadAsync. {0}", downloadSegment);
                 using var cancellationTokenSource = new CancellationTokenSource(StepTimeOut);
                 // 设置了 WebRequest.Timeout 不能用来修改异步的方法，所以需要使用下面方法
                 downloadSegment.LastDownTime = DateTime.Now;
                 var n = await responseStream.ReadAsync(buffer, 0, length, cancellationTokenSource.Token);
-                _logger.LogDebug("[DownloadSegmentInner] Finish ReadAsync. Length {0} {1}", n, downloadSegment);
+                LogDebugInternal("[DownloadSegmentInner] Finish ReadAsync. Length {0} {1}", n, downloadSegment);
                 downloadSegment.Message = "Finish ReadAsync";
 
                 if (n <= 0)
@@ -389,21 +490,21 @@ namespace dotnetCampus.FileDownloader
                 LogDownloadSegment(downloadSegment);
 
                 downloadSegment.Message = "QueueWrite";
-                _logger.LogDebug("[DownloadSegmentInner] QueueWrite. Start {0} Length {1}",
+                LogDebugInternal("[DownloadSegmentInner] QueueWrite. Start {0} Length {1}",
                     downloadSegment.CurrentDownloadPoint, n);
                 FileWriter.QueueWrite(downloadSegment.CurrentDownloadPoint, buffer, 0, n);
 
                 downloadSegment.DownloadedLength += n;
 
                 _progress.Report(new DownloadProgress(SegmentManager));
-                //控制开关，如果下载阻塞就先暂停
-                ControlSwitch(downloadSegment);
+
                 if (downloadSegment.LoadingState == DownloadingState.Pause)
                 {
                     break;
                 }
+
                 if (downloadSegment.Finished)
-                {                    
+                {
                     break;
                 }
             }
@@ -417,7 +518,7 @@ namespace dotnetCampus.FileDownloader
 
         private void Download(WebResponse? webResponse, DownloadSegment downloadSegment)
         {
-            _logger.LogDebug("[Download] Enqueue Download. {0}", downloadSegment);
+            LogDebugInternal("[Download] Enqueue Download. {0}", downloadSegment);
             DownloadDataList.Enqueue(new DownloadData(webResponse, downloadSegment));
         }
 
@@ -449,8 +550,12 @@ namespace dotnetCampus.FileDownloader
             }
 
             await FileWriter.DisposeAsync();
+#if NETCOREAPP
             await FileStream.DisposeAsync();
-            DownloadDataList.Dispose();
+#else
+            FileStream.Dispose();
+#endif
+            await DownloadDataList.DisposeAsync();
 
             FileDownloadTask.SetResult(true);
         }
